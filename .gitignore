@@ -1,3 +1,8 @@
+.states
+*.py[cod]
+*.db
+.web
+assets/external/
 .ipynb_checkpoints
 __pycache__/
 .env
