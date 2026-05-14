@@ -1,59 +1,51 @@
 import reflex as rx
 import pandas as pd
-import numpy as np
 
-# Cache for TF-IDF artifacts to avoid re-fitting on every request
 _tfidf_cache = {"vectorizer": None, "matrix": None, "df": None}
+df = pd.read_csv("Movies.csv")
 
-
+# calculation to build recommendations
 def build_recommendations(liked, disliked, seen, csv_path="Movies.csv"):
-
-    # Lazy import sklearn to avoid import-time overhead
     from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
 
     if _tfidf_cache["df"] is None:
-        df = pd.read_csv(csv_path)
-        df["features"] = df.get("genres", "").fillna("") + " " + df.get("keywords", "").fillna("")
+        df_local = pd.read_csv(csv_path)
+        df_local["features"] = (
+            df_local.get("genres", "").fillna("") + " " +
+            df_local.get("keywords", "").fillna("") + " "
+        )
         tfidf = TfidfVectorizer(stop_words="english")
-        tfidf_matrix = tfidf.fit_transform(df["features"])  # sparse csr_matrix
-        _tfidf_cache.update({"vectorizer": tfidf, "matrix": tfidf_matrix, "df": df})
+        tfidf_matrix = tfidf.fit_transform(df_local["features"])
+        _tfidf_cache.update({"vectorizer": tfidf, "matrix": tfidf_matrix, "df": df_local})
     else:
-        df = _tfidf_cache["df"]
+        df_local = _tfidf_cache["df"]
         tfidf_matrix = _tfidf_cache["matrix"]
 
-    # If no liked movies, nothing to recommend
     if not liked:
         return []
 
-    # Map titles to indices
-    liked_idx = df[df["title"].isin(liked)].index.tolist()
-    disliked_idx = df[df["title"].isin(disliked)].index.tolist()
+    liked_idx = df_local[df_local["title"].isin(liked)].index.tolist()
+    disliked_idx = df_local[df_local["title"].isin(disliked)].index.tolist()
 
-    # If liked titles not found in dataset, return empty
     if len(liked_idx) == 0:
         return []
 
-    liked_vecs = tfidf_matrix[liked_idx].toarray()
-    user_profile = liked_vecs.mean(axis=0)  # ndarray shape (D,)
+    liked_similarities = cosine_similarity(tfidf_matrix, tfidf_matrix[liked_idx])
+    liked_score = liked_similarities.max(axis=1)
+
+    df_copy = df_local.copy()
+    df_copy["liked_score"] = liked_score
 
     if len(disliked_idx) > 0:
-        disliked_vecs = tfidf_matrix[disliked_idx].toarray()
-        user_profile = user_profile - disliked_vecs.mean(axis=0)
+        disliked_similarities = cosine_similarity(tfidf_matrix, tfidf_matrix[disliked_idx])
+        disliked_score = disliked_similarities.max(axis=1)
+        df_copy["disliked_score"] = disliked_score
+        df_copy["score"] = df_copy["liked_score"] - (0.5 * df_copy["disliked_score"])
+    else:
+        df_copy["score"] = df_copy["liked_score"]
 
-    user_profile = np.asarray(user_profile).ravel()
-    norm = np.linalg.norm(user_profile)
-    if norm == 0:
-        return []
-    user_profile = user_profile / norm
-
-    # Compute similarity using sparse_matrix.dot(dense_vector) 
-    similarities = tfidf_matrix.dot(user_profile).flatten() 
-
-    df = df.copy()
-    df["score"] = similarities
-
-    # Exclude seen movies and return top results
-    recs = df[~df["title"].isin(seen)].sort_values("score", ascending=False)
+    recs = df_copy[~df_copy["title"].isin(seen)].sort_values("score", ascending=False)
     return recs.head(10).to_dict("records")
 
 
@@ -64,38 +56,53 @@ class State(rx.State):
     liked_movies: list[str] = []
     disliked_movies: list[str] = []
 
+# starts the process 
     def load_and_start(self):
-        try:
-            df = pd.read_csv("Movies.csv")
-            self.user_table = df.sample(15).to_dict("records")
-            self.count = 0
-            self.liked_movies = []
-            self.disliked_movies = []
-            return rx.redirect("/discover")
-        except Exception as e:
-            print(f"Error loading CSV: {e}")
+        valid_movies = df[df["poster_url"].notna() & (df["poster_url"] != "")].copy()
+        self.user_table = valid_movies.sample(min(200, len(valid_movies))).to_dict("records")
+        self.count = 0
+        self.liked_movies = []
+        self.disliked_movies = []
+        return rx.redirect("/discover")
 
+# Stores meta data of liked movies
     def liked(self):
         title = self.current_movie.get("title")
         if title:
             self.liked_movies.append(title)
         return self.next_movie()
 
+# Stores meta data of disliked movies
     def disliked(self):
         title = self.current_movie.get("title")
         if title:
             self.disliked_movies.append(title)
         return self.next_movie()
 
+# Changes the movies in discover page
     def next_movie(self):
         self.count += 1
-        if self.count >= 15:
+        if len(self.liked_movies) + len(self.disliked_movies) >= 10:
             return rx.redirect("/foryou")
 
+# Handles when a movie is skipped in discover page
+    def skipped(self):
+        return self.next_movie()
+
+# Handles when back is pressed in discover page
+    def back(self):
+        if self.count > 0:
+            self.count -= 2
+        else:
+            self.count = -1
+        return self.next_movie()
+
+# Reset the app values to default
     def reset_to_main(self):
         self.count = 0
         return rx.redirect("/")
 
+# Stores the meta data of the movie currently shown on discover page
     @rx.var
     def current_movie(self) -> dict:
         if self.user_table and self.count < len(self.user_table):
@@ -105,7 +112,17 @@ class State(rx.State):
             "poster_url": "https://via.placeholder.com/300x450?text=No+Poster",
             "genres": "Unknown",
         }
-        
+
+# Preloads movies in cache to reduce loading time
+    @rx.var
+    def preload_movies(self) -> list[dict]:
+        if self.user_table and self.count < len(self.user_table):
+            start_idx = self.count + 1
+            end_idx = min(self.count + 20, len(self.user_table))
+            return self.user_table[start_idx:end_idx]
+        return []
+
+# Stores the meta data of movies recommended by the build_recommendations function
     @rx.var
     def recommendations(self) -> list[dict]:
         if not self.liked_movies:
@@ -113,29 +130,39 @@ class State(rx.State):
         seen_titles = [m.get("title") for m in self.user_table if m.get("title")]
         return build_recommendations(self.liked_movies, self.disliked_movies, seen_titles)
 
+
+# UI elements
+
+# NavBar
 def navbar() -> rx.Component:
     return rx.flex(
-        rx.text(
+        rx.button(
             "LUME",
+            on_click=State.reset_to_main,
             color="white",
             font_size="2rem",
             font_weight="700",
             letter_spacing="20px",
-            text_align="center",
+            background_color="transparent",
+            border="none",
+            padding_x="0",
+            padding_y="0",
+            cursor="pointer",
+            _hover={"transform": "scale(1.05)"},
+            transition="all 0.8s ease",
         ),
         background_color="#8B0000",
         border="2px solid rgba(255,255,255,0.12)",
-        height="80px",
+        height="75px",
         width="100%",
         position="fixed",
-        top="0",
-        left="0",
         z_index="1000",
         align="center",
         justify="center",
         padding_x="20px",
     )
 
+# Home page
 def index() -> rx.Component:
     return rx.box(
         navbar(),
@@ -202,136 +229,268 @@ def index() -> rx.Component:
         background_color="#1A0F0F",
     )
 
-
+# Discover page
 def discover_page() -> rx.Component:
     return rx.box(
         navbar(),
         rx.box(
-            rx.image(
-                src=State.current_movie["poster_url"],
-                width="450px",
-                border_radius="15px",
-                user_select="none",
-                style={"transition": "transform 0.3s ease-out"},
-                _hover={"transform": "scale(1.01)"},
-            ),
-            position="relative",
-        ),
-        rx.hstack(
-            rx.button(
-                "Dislike",
-                on_click=State.disliked,
-                background_color="#A52A2A",
-                font_size="2rem",
-                color="white",
-                width="150px",
-                height="50px",
-                _hover={
-                    "transform": "scale(1.02)",
-                    "background_color": "#8B1A1A",
-                    "color": "#FFD7D7",
+            rx.box(
+                [
+                    rx.text(
+                        letter,
+                        color="#8b0000",
+                        font_size="7rem",
+                        font_weight="bold",
+                        line_height="0.6",
+                        style={
+                            "transform": "rotate(90deg)",
+                            "display": "inline-block",
+                            "transformOrigin": "center center",
+                            "margin": "0",
+                        },
+                    )
+                    for letter in "#Discover"
+                ],
+                style={
+                    "display": "flex",
+                    "flexDirection": "column",
+                    "alignItems": "center",
+                    "gap": "6px",
+                    "transform": "rotate(0deg)",
+                    "display": "inline-flex",
                 },
-                transition="all 0.3s ease",
             ),
-            rx.button(
-                "Like",
-                on_click=State.liked,
-                background_color="#A52A2A",
-                font_size="2rem",
-                color="white",
-                width="150px",
-                height="50px",
-                _hover={
-                    "transform": "scale(1.02)",
-                    "background_color": "#8B1A1A",
-                    "color": "#FFD7D7",
-                },
-                transition="all 0.3s ease",
-            ),
+            padding_top="0px",
+            padding_left="20px",
+            width="auto",
+            display="flex",
+            justify_content="start",
+            position="absolute",
+            left="0",
+            top="140px",
+            z_index="5",
         ),
-        background="#1A0F0F",
+        rx.box(
+            rx.foreach(
+                State.preload_movies,
+                lambda movie: rx.image(src=movie.get("poster_url"), display="none"),
+            ),
+            display="none",
+        ),
+        rx.flex(
+            rx.hstack(
+                rx.image(
+                    src=State.current_movie["poster_url"],
+                    width="500px",
+                    height="auto",
+                    border_radius="15px",
+                    user_select="none",
+                ),
+                rx.vstack(
+                    rx.box(
+                        rx.text(
+                            State.current_movie["title"],
+                            color="white",
+                            font_size="3rem",
+                            font_weight="bold",
+                            text_align="left",
+                        ),
+                    ),
+                    rx.text(
+                        "Genre: " + State.current_movie["genres"]
+                        .to_string()
+                        .replace("[", "")
+                        .replace("]", "")
+                        .replace("'", "")
+                        .replace('"', ""),
+                        color="#D3C0C0",
+                        font_size="2rem",
+                        font_weight="bold",
+                        text_align="left",
+                    ),
+                    rx.hstack(
+                        rx.button(
+                            "Dislike",
+                            on_click=State.disliked,
+                            background_color="#7A1C1C",
+                            font_size="2rem",
+                            color="white",
+                            width="250px",
+                            height="100px",
+                            border_radius="10px",
+                            _hover={"transform": "scale(1.02)", "background_color": "#993333", "color": "#FFD7D7"},
+                            transition="all 0.3s ease",
+                        ),
+                        rx.button(
+                            "Like",
+                            on_click=State.liked,
+                            background_color="#145214",
+                            font_size="2rem",
+                            color="white",
+                            width="250px",
+                            height="100px",
+                            border_radius="10px",
+                            _hover={"transform": "scale(1.02)", "background_color": "#1E6A1E", "color": "#D7FFD7"},
+                            transition="all 0.3s ease",
+                        ),
+                        spacing="2",
+                        position="absolute",
+                        bottom="100px",
+                        left="0",
+                        right="0",
+                        top="590px",
+                        justify_content="center",
+                    ),
+                    rx.hstack(
+                        rx.button(
+                            "Back",
+                            on_click=State.back,
+                            background_color="#444444",
+                            font_size="1.5rem",
+                            color="white",
+                            width="150px",
+                            height="50px",
+                            border_radius="10px",
+                            _hover={"transform": "scale(1.02)", "background_color": "#666666", "color": "#E0E0E0"},
+                            transition="all 0.3s ease",
+                        ),
+                        rx.button(
+                            "Restart",
+                            on_click=State.load_and_start,
+                            background_color="#444444",
+                            font_size="1.5rem",
+                            color="white",
+                            width="180px",
+                            height="50px",
+                            border_radius="10px",
+                            _hover={"transform": "scale(1.02)", "background_color": "#666666", "color": "#E0E0E0"},
+                            transition="all 0.3s ease",
+                        ),
+                        rx.button(
+                            "Skip",
+                            on_click=State.skipped,
+                            background_color="#444444",
+                            font_size="1.5rem",
+                            color="white",
+                            width="150px",
+                            height="50px",
+                            border_radius="10px",
+                            _hover={"transform": "scale(1.02)", "background_color": "#666666", "color": "#E0E0E0"},
+                            transition="all 0.3s ease",
+                        ),
+                        spacing="2",
+                        position="absolute",
+                        bottom="100px",
+                        left="0",
+                        right="0",
+                        top="700px",
+                        justify_content="start",
+                        gap="10px",
+                    ),
+                    border_radius="10px",
+                    width="500px",
+                    text_align="center",
+                    position="relative",
+                    min_height="700px",
+                ),
+                background_color="rgba(139, 0, 0, 0.3)",
+                height="80vh",
+                padding="30px",
+                border_radius="20px",
+                spacing="6",
+                align_items="start",
+            ),
+            width="100%",
+            justify_content="center",
+            margin_top="140px",
+        ),
+        background_color="#1A0F0F",
+        height="100vh",
+        overflow="hidden",
         width="100%",
-        display="flex",
-        min_height="100vh",
-        justify_content="center",
-        align_items="center",
         flex_direction="column",
         gap="40px",
     )
 
 
+#For You page
 def foryou_page() -> rx.Component:
     def card(movie):
         return rx.box(
             rx.image(
                 src=rx.cond(movie["poster_url"], movie["poster_url"], "https://via.placeholder.com/200x300"),
-                width="250px",
+                width="280px",
+                height="360px",
                 border_radius="10px",
-                style={"transition": "transform 0.3s ease-out"},
-                _hover={"box_shadow":"10px,10px,0px,0px ,rgba(100,100,100,1)"}
+                loading="eager",
             ),
             rx.text(
                 rx.cond(movie["title"], movie["title"], "Unknown"),
+                max_width="220px",
+                white_space="normal",
+                overflow_wrap="break-word",
+                word_break="break-word",
                 color="white",
-                font_size="1rem",
-                margin_top="10px",
-                text_align="center",
-                max_width="250px",
-                overflow="auto",
-                white_space="nowrap",
+                font_size="1.1rem",
+                margin_top="5px",
             ),
-            background_color="rgba(255,255,255,0.03)",
-            padding="20px",
+            background_color="rgba(139, 0, 0, 0.3)",
+            padding="10px",
             border_radius="12px",
             margin="10px",
             transition="all 0.35s ease-out",
-            _hover={
-                "transform": "translateY(-6px)",
-                "box_shadow": "0 8px 30px rgba(0,0,0,0.6)",
-            },
+            _hover={"transform": "translateY(-6px)", "box_shadow": "0 8px 30px rgba(0,0,0,0.6)"},
         )
 
     return rx.box(
         navbar(),
-        rx.center(
-            rx.vstack(
-                rx.heading(
-                    "For You",
-                    color="white",
-                    font_size="3rem",
-                    margin_bottom="20px",
+        rx.hstack(
+            rx.box(
+                rx.box(
+                    [
+                        rx.text(
+                            letter,
+                            color="#8b0000",
+                            font_size="5.5rem",
+                            font_weight="bold",
+                            line_height="0.5",
+                            style={"transform": "rotate(90deg)", "display": "inline-block", "transformOrigin": "center center", "margin": "0"},
+                        )
+                        for letter in "#PickYourPoison"
+                    ],
+                    style={"display": "flex", "flexDirection": "column", "alignItems": "center", "gap": "6px", "transform": "rotate(0deg)", "display": "inline-flex"},
                 ),
+                padding_top="100px",
+                padding_left="20px",
+                width="30%",
+                display="flex",
+            ),
+            rx.box(
                 rx.flex(
                     rx.foreach(
                         State.recommendations,
                         lambda movie: card(movie),
                     ),
                     wrap="wrap",
-                    justify="center",
-                    gap="20px",
+                    justify="start",
+                    padding_y="75px",
                 ),
-                rx.button(
-                    "Back",
-                    on_click=State.reset_to_main,
-                    background_color="#E50914",
-                    color="white",
-                    size="4",
-                    padding_x="40px",
-                    _hover={
-                        "background_color": "#b20710",
-                        "transform": "scale(1.05)",
-                    },
-                ),
-                spacing="6",
-                margin_top="50px",
+                width="300%",
             ),
+            width="100%",
+            align_items="start",
+            justify_content="start",
+            background_color="#1A0F0F",
+            gap="0px",
         ),
         width="100%",
         height="100vh",
         background_color="#1A0F0F",
+        overflow_x="hidden",
+        overflow_y="hidden",
     )
 
-
+#app
 app = rx.App(style={"body": {"background_color": "#8f0000"}})
 app.add_page(index, route="/")
 app.add_page(discover_page, route="/discover")
